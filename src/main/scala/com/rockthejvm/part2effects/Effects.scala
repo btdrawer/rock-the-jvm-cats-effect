@@ -44,6 +44,10 @@ object Effects extends App {
     * 2. Yes - the return type is in the type signature
     * 3. Yes - it does not execute side effects when constructed
     * -> Yes
+    *
+    * IO is the holy grail of bridging pure FP and impure computation,
+    * because it is the most _generic_ effect imaginable.
+    * It forms the basis of cats-effect.
     */
   final case class MyIO[A](unsafeRun: () => A) {
     def map[B](f: A => B): MyIO[B] =
