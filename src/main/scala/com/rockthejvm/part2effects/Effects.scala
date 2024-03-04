@@ -1,5 +1,7 @@
 package com.rockthejvm.part2effects
 
+import scala.io.StdIn
+
 object Effects extends App {
 
   /** Substitution: I can replace an expression with the value it evaluates to
@@ -56,4 +58,37 @@ object Effects extends App {
     def flatMap[B](f: A => MyIO[B]): MyIO[B] =
       MyIO(() => f(unsafeRun()).unsafeRun())
   }
+
+  /** Exercises */
+
+  /* 1. A MyIO which returns the current time of the system. */
+  private def currentTime: MyIO[Long] =
+    MyIO(() => System.currentTimeMillis())
+
+  /* 2. A MyIO which measures the duration of a computation. */
+  private def measure[A](fa: MyIO[A]): MyIO[Long] =
+    for {
+      startTime <- currentTime
+      _ <- fa
+      endTime <- currentTime
+    } yield endTime - startTime
+
+  println(
+    measure(
+      MyIO(() => Thread.sleep(500))
+    ).unsafeRun()
+  )
+
+  /* 3. A MyIO which prints something to the console. */
+  private def printIO(str: String): MyIO[Unit] =
+    MyIO(() => println(str))
+
+  /* 4. A MyIO which reads a line from the std input. */
+  private def readStdInLineIO: MyIO[String] =
+    MyIO(() => StdIn.readLine())
+
+  (for {
+    in <- readStdInLineIO
+    _ <- printIO(in)
+  } yield ()).unsafeRun()
 }
