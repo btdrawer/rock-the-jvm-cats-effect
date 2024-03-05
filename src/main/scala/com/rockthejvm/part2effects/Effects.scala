@@ -62,6 +62,7 @@ object Effects extends App {
   /** Exercises */
 
   /* 1. A MyIO which returns the current time of the system. */
+  // NB can be a val
   private def currentTime: MyIO[Long] =
     MyIO(() => System.currentTimeMillis())
 
@@ -73,22 +74,31 @@ object Effects extends App {
       endTime <- currentTime
     } yield endTime - startTime
 
-  println(
-    measure(
-      MyIO(() => Thread.sleep(500))
-    ).unsafeRun()
-  )
-
   /* 3. A MyIO which prints something to the console. */
-  private def printIO(str: String): MyIO[Unit] =
+  private def print(str: String): MyIO[Unit] =
     MyIO(() => println(str))
 
   /* 4. A MyIO which reads a line from the std input. */
-  private def readStdInLineIO: MyIO[String] =
+  // NB can also be a val
+  private def readStdInLine: MyIO[String] =
     MyIO(() => StdIn.readLine())
 
-  (for {
-    in <- readStdInLineIO
-    _ <- printIO(in)
-  } yield ()).unsafeRun()
+  private val measuring: MyIO[Unit] =
+    for {
+      timeTaken <-
+        measure(
+          MyIO(() => Thread.sleep(500))
+        )
+      _ <- print(timeTaken.toString)
+    } yield ()
+
+  private val concatenate: MyIO[Unit] =
+    for {
+      in1 <- readStdInLine
+      in2 <- readStdInLine
+      _ <- print(in1 + in2)
+    } yield ()
+
+  measuring.unsafeRun()
+  concatenate.unsafeRun()
 }
