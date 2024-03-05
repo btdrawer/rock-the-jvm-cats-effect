@@ -92,6 +92,15 @@ object Effects extends App {
       _ <- print(timeTaken.toString)
     } yield ()
 
+  /*
+   * This is fundamentally similar to imperative code:
+   * 1. read from console
+   * 2. read from console
+   * 3. print to console
+   *
+   * What we are essentially doing is DESCRIBING an imperative program
+   * as a series of data structure transformations.
+   */
   private val concatenate: MyIO[Unit] =
     for {
       in1 <- readStdInLine
