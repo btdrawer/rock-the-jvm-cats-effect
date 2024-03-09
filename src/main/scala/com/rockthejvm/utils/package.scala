@@ -7,7 +7,7 @@ package object utils {
     def debug: IO[A] = for {
       a <- ioa
       t = Thread.currentThread().getName
-      _ = println(s"[$t] $a")
+      _ <- IO(println(s"[$t] $a"))
     } yield a
   }
 }
