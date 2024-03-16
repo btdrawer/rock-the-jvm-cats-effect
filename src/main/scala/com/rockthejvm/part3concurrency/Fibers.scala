@@ -117,7 +117,7 @@ object Fibers extends IOApp.Simple {
    *  - return the result in an IO
    *  - if errored or canceled, return a failed IO
    */
-  private def processResultsFromFiber[A](ioa: IO[A]): IO[A] =
+  def processResultsFromFiber[A](ioa: IO[A]): IO[A] =
     for {
       fib <- ioa.start
       outcome <- fib.join
