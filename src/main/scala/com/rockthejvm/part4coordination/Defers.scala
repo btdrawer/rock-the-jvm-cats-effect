@@ -286,8 +286,6 @@ object Defers extends IOApp.Simple {
       } yield result
     }
 
-  IO.racePair()
-
   private val ioa = IO.sleep(1.second) >> IO("hello")
   // If a fiber cancels first, that will be returned (same behaviour as the actual IO.racePair)
   private val iob = IO.sleep(500.millis) >> IO.canceled >> IO(2)
