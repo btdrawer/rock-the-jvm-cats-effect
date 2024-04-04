@@ -1,9 +1,11 @@
 package com.rockthejvm.part4coordination
 
 import cats.Parallel
+import cats.effect.implicits.{genSpawnOps, monadCancelOps_}
 import cats.effect.kernel.Async
+import cats.effect.kernel.Outcome.{Canceled, Errored, Succeeded}
 import cats.effect.std.Queue
-import cats.effect.{Deferred, IO, IOApp, Ref}
+import cats.effect.{Deferred, IO, IOApp, Poll, Ref}
 import cats.implicits._
 import com.rockthejvm.utils.DebugWrapper
 
@@ -50,7 +52,8 @@ object Mutex {
   }
 }
 
-/** The above solution works, this one uses the hints from the video
+/** The above solution works, this one (under `createSimpleMutex`) uses the hints from the video,
+  * and then `createMutexWithCancellation` is part 2 (cancelling).
   *
   * The full solution then given in the video uses a standard Scala Queue,
   * whereas here I used a cats-effect Queue.
@@ -71,14 +74,12 @@ object MutexV2 {
       queue <- Queue.unbounded[F, Signal[F]]
       unlocked = State(locked = false, queue)
       ref <- Ref[F].of(unlocked)
-    } yield new Mutex[F] {
-      private def addSignalToQueueAndWait(): F[Unit] =
-        for {
-          signal <- Deferred[F, Unit]
-          _ <- queue.offer(signal)
-          _ <- signal.get
-        } yield ()
+    } yield createMutexWithCancellation[F](ref)
 
+  private def createSimpleMutex[F[_]](
+      ref: Ref[F, State[F]]
+  )(implicit A: Async[F]): Mutex[F] =
+    new Mutex[F] {
       /*
        * Change the state of the Ref:
        * - If unlocked, state becomes (true, [])
@@ -90,7 +91,7 @@ object MutexV2 {
             State(locked = true, queue) -> A.unit
 
           case state =>
-            state -> addSignalToQueueAndWait()
+            state -> addSignalToQueueAndWait(state.waiting)
         }.flatten
 
       /*
@@ -117,6 +118,88 @@ object MutexV2 {
                 }
             } yield ())
         }.flatten
+
+      private def addSignalToQueueAndWait(queue: Queue[F, Signal[F]]): F[Unit] =
+        for {
+          signal <- Deferred[F, Unit]
+          _ <- queue.offer(signal)
+          _ <- signal.get
+        } yield ()
+    }
+
+  /** Exercise 2: What if we cancel the fiber? What things should be cancellable?
+    *
+    * NB this doesn't always work - sometimes hangs, will try to fix later
+    */
+  private def createMutexWithCancellation[F[_]](
+      ref: Ref[F, State[F]]
+  )(implicit A: Async[F]): Mutex[F] =
+    new Mutex[F] {
+      override def acquire: F[Unit] =
+        A.uncancelable { poll =>
+          ref.modify {
+            case State(false, queue) =>
+              State(locked = true, queue) -> A.unit
+
+            case state =>
+              // See `addSignalToQueueAndWait` for one thing that should be cancelled
+              state -> addSignalToQueueAndWait(state.waiting, poll)
+          }.flatten
+        }
+
+      private def addSignalToQueueAndWait(
+          queue: Queue[F, Signal[F]],
+          poll: Poll[F]
+      ): F[Unit] =
+        for {
+          signal <- Deferred[F, Unit]
+          _ <- queue.offer(signal)
+          /*
+           * `signal.get` is the one thing that should be cancelable because it does not affect lock state
+           *
+           * This solution is different from the video, again because of my use of a cats-effect poll, meaning
+           * we cannot simply filter out the signal we want.
+           * Instead, because we don't know where in the queue our signal is, we have to complete the signal here,
+           * and then the next time `release` is called, it will simply release _again_ if the signal it finds
+           * has already been completed before.
+           */
+          _ <- poll(signal.get).onCancel(signal.complete(()).void)
+        } yield ()
+
+      /*
+       * The whole release should be uncancelable because we want the lock to be available
+       * to other processes after the fiber is cancelled
+       *
+       * (The data may not be in a good state, but the alternative would be to have the lock
+       * permanently held)
+       *
+       * MINOR CORRECTION FROM VIDEO: Correct that we don't want release to be cancelable, but this is, in fact,
+       * _already_ the case as `modify` is atomic - so the A.uncancelable wrapper is redundant.
+       */
+      override def release: F[Unit] =
+        A.uncancelable { _ =>
+          ref.modify {
+            case state if !state.locked =>
+              state -> A.unit
+
+            case state @ State(_, queue) =>
+              state -> (for {
+                signalOpt <- queue.tryTake
+                _ <-
+                  signalOpt match {
+                    case Some(signal) =>
+                      for {
+                        justCompleted <- signal.complete(())
+                        _ <-
+                          if (justCompleted) A.unit
+                          else release
+                      } yield ()
+                    case None =>
+                      ref.update(_.copy(locked = false))
+                  }
+              } yield ())
+          }.flatten
+        }
     }
 }
 
@@ -164,5 +247,39 @@ object MutexPlayground extends IOApp.Simple {
         )
     } yield results
 
-  override def run: IO[Unit] = demoLockingTask[IO].debug.void
+  private def createCancellingTask[F[_]](
+      id: Int,
+      mutex: Mutex[F]
+  )(implicit A: Async[F]): F[Int] =
+    if (id % 2 == 0)
+      createLockingTask(
+        id,
+        mutex
+      ) // even IDs will be the same tasks we tested earlier
+    else
+      for { // naughty for-comp
+        fib <-
+          createLockingTask(id, mutex)
+            .onCancel(A.pure(s"[task $id] cancelling...").debug.void)
+            .start
+        _ <- A.sleep(2.seconds) >> fib.cancel
+        out <- fib.join
+        result <-
+          out match {
+            case Succeeded(fa) => fa
+            case Errored(_)    => A.pure(-1)
+            case Canceled()    => A.pure(-2)
+          }
+      } yield result
+
+  private def demoCancellingTasks[F[_]: Async: Parallel]: F[List[Int]] =
+    for {
+      mutex <- Mutex.create[F]
+      results <-
+        (1 to 10).toList.parTraverse[F, Int](
+          createCancellingTask[F](_, mutex)
+        )
+    } yield results
+
+  override def run: IO[Unit] = demoCancellingTasks[IO].debug.void
 }
