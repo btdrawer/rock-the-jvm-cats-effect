@@ -4,11 +4,12 @@ import cats.Parallel
 import cats.effect.implicits.{genSpawnOps, monadCancelOps_}
 import cats.effect.kernel.Async
 import cats.effect.kernel.Outcome.{Canceled, Errored, Succeeded}
-import cats.effect.std.Queue
+import cats.effect.std.{Queue, UUIDGen}
 import cats.effect.{Deferred, IO, IOApp, Poll, Ref}
 import cats.implicits._
 import com.rockthejvm.utils.DebugWrapper
 
+import java.util.UUID
 import scala.concurrent.duration.DurationInt
 import scala.util.Random
 
@@ -71,8 +72,8 @@ object MutexV2 {
 
   def create[F[_]](implicit A: Async[F]): F[Mutex[F]] =
     for {
-      queue <- Queue.unbounded[F, Signal[F]]
-      unlocked = State(locked = false, queue)
+      queue <- Queue.unbounded[F, (UUID, Signal[F])]
+      unlocked = StateForCancellation(locked = false, queue, Set.empty[UUID])
       ref <- Ref[F].of(unlocked)
     } yield createMutexWithCancellation[F](ref)
 
@@ -127,33 +128,37 @@ object MutexV2 {
         } yield ()
     }
 
+  private final case class StateForCancellation[F[_]](
+      locked: Boolean,
+      waiting: Queue[F, (UUID, Signal[F])],
+      cancelled: Set[UUID]
+  )
+
   /** Exercise 2: What if we cancel the fiber? What things should be cancellable?
-    *
-    * NB this doesn't always work - sometimes hangs, will try to fix later
     */
   private def createMutexWithCancellation[F[_]](
-      ref: Ref[F, State[F]]
-  )(implicit A: Async[F]): Mutex[F] =
+      ref: Ref[F, StateForCancellation[F]]
+  )(implicit A: Async[F], UG: UUIDGen[F]): Mutex[F] =
     new Mutex[F] {
       override def acquire: F[Unit] =
         A.uncancelable { poll =>
           ref.modify {
-            case State(false, queue) =>
-              State(locked = true, queue) -> A.unit
+            case StateForCancellation(false, waiting, cancelled) =>
+              StateForCancellation(locked = true, waiting, cancelled) -> A.unit
 
             case state =>
-              // See `addSignalToQueueAndWait` for one thing that should be cancelled
               state -> addSignalToQueueAndWait(state.waiting, poll)
           }.flatten
         }
 
       private def addSignalToQueueAndWait(
-          queue: Queue[F, Signal[F]],
+          waiting: Queue[F, (UUID, Signal[F])],
           poll: Poll[F]
       ): F[Unit] =
         for {
+          uuid <- UG.randomUUID
           signal <- Deferred[F, Unit]
-          _ <- queue.offer(signal)
+          _ <- waiting.offer(uuid -> signal)
           /*
            * `signal.get` is the one thing that should be cancelable because it does not affect lock state
            *
@@ -162,8 +167,20 @@ object MutexV2 {
            * Instead, because we don't know where in the queue our signal is, we have to complete the signal here,
            * and then the next time `release` is called, it will simply release _again_ if the signal it finds
            * has already been completed before.
+           *
+           * However, I originally got the logic wrong as all I did on cancellation was complete the present
+           * signal. This is only sufficient if the lock is not currently in use; otherwise, we need to
+           * acquire the lock (so that we don't have multiple cancelled fibers releasing simultaneously) and
+           * then release it.
            */
-          _ <- poll(signal.get).onCancel(signal.complete(()).void)
+          _ <- poll(signal.get).onCancel {
+            ref.modify {
+              case StateForCancellation(locked, waiting, cancelled) =>
+                StateForCancellation(locked, waiting, cancelled + uuid) ->
+                  (if (locked) signal.complete(()) >> acquire >> release
+                   else signal.complete(()).void)
+            }.flatten
+          }
         } yield ()
 
       /*
@@ -182,16 +199,16 @@ object MutexV2 {
             case state if !state.locked =>
               state -> A.unit
 
-            case state @ State(_, queue) =>
+            case state @ StateForCancellation(_, waiting, cancelled) =>
               state -> (for {
-                signalOpt <- queue.tryTake
+                signalOpt <- waiting.tryTake
                 _ <-
                   signalOpt match {
-                    case Some(signal) =>
+                    case Some((uuid, signal)) =>
                       for {
                         justCompleted <- signal.complete(())
                         _ <-
-                          if (justCompleted) A.unit
+                          if (justCompleted && !cancelled.contains(uuid)) A.unit
                           else release
                       } yield ()
                     case None =>
@@ -274,7 +291,7 @@ object MutexPlayground extends IOApp.Simple {
 
   private def demoCancellingTasks[F[_]: Async: Parallel]: F[List[Int]] =
     for {
-      mutex <- Mutex.create[F]
+      mutex <- MutexV2.create[F]
       results <-
         (1 to 10).toList.parTraverse[F, Int](
           createCancellingTask[F](_, mutex)
