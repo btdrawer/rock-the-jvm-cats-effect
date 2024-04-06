@@ -164,14 +164,7 @@ object MutexV2 {
            *
            * This solution is different from the video, again because of my use of a cats-effect poll, meaning
            * we cannot simply filter out the signal we want.
-           * Instead, because we don't know where in the queue our signal is, we have to complete the signal here,
-           * and then the next time `release` is called, it will simply release _again_ if the signal it finds
-           * has already been completed before.
-           *
-           * However, I originally got the logic wrong as all I did on cancellation was complete the present
-           * signal. This is only sufficient if the lock is not currently in use; otherwise, we need to
-           * acquire the lock (so that we don't have multiple cancelled fibers releasing simultaneously) and
-           * then release it.
+           * Instead, because we don't know where in the queue our signal is, we have to complete the signal here.
            */
           _ <- poll(signal.get).onCancel {
             ref.modify {
