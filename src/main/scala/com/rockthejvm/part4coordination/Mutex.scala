@@ -4,12 +4,11 @@ import cats.Parallel
 import cats.effect.implicits.{genSpawnOps, monadCancelOps_}
 import cats.effect.kernel.Async
 import cats.effect.kernel.Outcome.{Canceled, Errored, Succeeded}
-import cats.effect.std.{Queue, UUIDGen}
+import cats.effect.std.Queue
 import cats.effect.{Deferred, IO, IOApp, Poll, Ref}
 import cats.implicits._
 import com.rockthejvm.utils.DebugWrapper
 
-import java.util.UUID
 import scala.concurrent.duration.DurationInt
 import scala.util.Random
 
@@ -72,8 +71,8 @@ object MutexV2 {
 
   def create[F[_]](implicit A: Async[F]): F[Mutex[F]] =
     for {
-      queue <- Queue.unbounded[F, (UUID, Signal[F])]
-      unlocked = StateForCancellation(locked = false, queue, Set.empty[UUID])
+      queue <- Queue.unbounded[F, Signal[F]]
+      unlocked = State(locked = false, queue)
       ref <- Ref[F].of(unlocked)
     } yield createMutexWithCancellation[F](ref)
 
@@ -128,23 +127,17 @@ object MutexV2 {
         } yield ()
     }
 
-  private final case class StateForCancellation[F[_]](
-      locked: Boolean,
-      waiting: Queue[F, (UUID, Signal[F])],
-      cancelled: Set[UUID]
-  )
-
   /** Exercise 2: What if we cancel the fiber? What things should be cancellable?
     */
   private def createMutexWithCancellation[F[_]](
-      ref: Ref[F, StateForCancellation[F]]
-  )(implicit A: Async[F], UG: UUIDGen[F]): Mutex[F] =
+      ref: Ref[F, State[F]]
+  )(implicit A: Async[F]): Mutex[F] =
     new Mutex[F] {
       override def acquire: F[Unit] =
         A.uncancelable { poll =>
           ref.modify {
-            case StateForCancellation(false, waiting, cancelled) =>
-              StateForCancellation(locked = true, waiting, cancelled) -> A.unit
+            case State(false, waiting) =>
+              State(locked = true, waiting) -> A.unit
 
             case state =>
               state -> addSignalToQueueAndWait(state.waiting, poll)
@@ -152,28 +145,28 @@ object MutexV2 {
         }
 
       private def addSignalToQueueAndWait(
-          waiting: Queue[F, (UUID, Signal[F])],
+          waiting: Queue[F, Signal[F]],
           poll: Poll[F]
       ): F[Unit] =
         for {
-          uuid <- UG.randomUUID
           signal <- Deferred[F, Unit]
-          _ <- waiting.offer(uuid -> signal)
-          /*
-           * `signal.get` is the one thing that should be cancelable because it does not affect lock state
-           *
-           * This solution is different from the video, again because of my use of a cats-effect poll, meaning
-           * we cannot simply filter out the signal we want.
-           * Instead, because we don't know where in the queue our signal is, we have to complete the signal here.
-           */
-          _ <- poll(signal.get).onCancel {
-            ref.modify {
-              case StateForCancellation(locked, waiting, cancelled) =>
-                StateForCancellation(locked, waiting, cancelled + uuid) ->
-                  (if (locked) signal.complete(()) >> acquire >> release
-                   else signal.complete(()).void)
-            }.flatten
-          }
+          _ <- waiting.offer(signal)
+          // `signal.get` is the one thing that should be cancelable because it does not affect lock state
+          _ <- poll(signal.get).onCancel(releaseCancelledSignal(signal))
+        } yield ()
+
+      /*
+       * This solution is different from the video, again because of my use of a cats-effect poll, meaning
+       * we cannot simply filter out the signal we want.
+       * Instead, because we don't know where in the queue our signal is, we have to complete the signal here.
+       */
+      private def releaseCancelledSignal(
+          signal: Signal[F]
+      ): F[Unit] =
+        for {
+          _ <- signal.complete(())
+          state <- ref.get
+          _ <- if (state.locked) A.unit else release
         } yield ()
 
       /*
@@ -192,24 +185,32 @@ object MutexV2 {
             case state if !state.locked =>
               state -> A.unit
 
-            case state @ StateForCancellation(_, waiting, cancelled) =>
-              state -> (for {
-                signalOpt <- waiting.tryTake
-                _ <-
-                  signalOpt match {
-                    case Some((uuid, signal)) =>
-                      for {
-                        justCompleted <- signal.complete(())
-                        _ <-
-                          if (justCompleted && !cancelled.contains(uuid)) A.unit
-                          else release
-                      } yield ()
-                    case None =>
-                      ref.update(_.copy(locked = false))
-                  }
-              } yield ())
+            case state @ State(_, waiting) =>
+              state -> releaseSignalIfExists(waiting)
           }.flatten
         }
+
+      private def releaseSignalIfExists(
+          waiting: Queue[F, Signal[F]]
+      ): F[Unit] =
+        for {
+          signalOpt <- waiting.tryTake
+          _ <-
+            signalOpt match {
+              case Some(signal) => releaseSignal(signal)
+              case None         => unlock
+            }
+        } yield ()
+
+      private def releaseSignal(
+          signal: Signal[F]
+      ): F[Unit] =
+        for {
+          justCompleted <- signal.complete(())
+          _ <- if (justCompleted) A.unit else release
+        } yield ()
+
+      private def unlock: F[Unit] = ref.update(_.copy(locked = false))
     }
 }
 
@@ -240,7 +241,7 @@ object MutexPlayground extends IOApp.Simple {
       // critical section
       _ <- mutex.acquire // blocks if mutex has been acquired
       _ <- A.delay(s"[task $id] working...").debug
-      result <- criticalTask
+      result <- criticalTask.onCancel(mutex.release)
       _ <- A.delay(s"[task $id] got result: $result").debug
       // critical section ends
       _ <- mutex.release
@@ -272,7 +273,7 @@ object MutexPlayground extends IOApp.Simple {
           createLockingTask(id, mutex)
             .onCancel(A.pure(s"[task $id] cancelling...").debug.void)
             .start
-        _ <- A.sleep(2.seconds) >> fib.cancel
+        _ <- A.sleep(1.seconds) >> fib.cancel
         out <- fib.join
         result <-
           out match {
