@@ -186,11 +186,11 @@ object MutexV2 {
               state -> A.unit
 
             case state @ State(_, waiting) =>
-              state -> releaseSignalIfExists(waiting)
+              state -> releaseSignalOrUnlock(waiting)
           }.flatten
         }
 
-      private def releaseSignalIfExists(
+      private def releaseSignalOrUnlock(
           waiting: Queue[F, Signal[F]]
       ): F[Unit] =
         for {
