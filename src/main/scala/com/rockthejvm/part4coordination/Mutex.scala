@@ -273,7 +273,7 @@ object MutexPlayground extends IOApp.Simple {
           createLockingTask(id, mutex)
             .onCancel(A.pure(s"[task $id] cancelling...").debug.void)
             .start
-        _ <- A.sleep(1.seconds) >> fib.cancel
+        _ <- A.sleep(2.seconds) >> fib.cancel
         out <- fib.join
         result <-
           out match {
