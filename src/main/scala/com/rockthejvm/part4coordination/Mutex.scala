@@ -7,6 +7,7 @@ import cats.effect.kernel.Outcome.{Canceled, Errored, Succeeded}
 import cats.effect.std.Queue
 import cats.effect.{Deferred, IO, IOApp, Poll, Ref}
 import cats.implicits._
+import com.rockthejvm.part4coordination.State.Signal
 import com.rockthejvm.utils.DebugWrapper
 
 import scala.concurrent.duration.DurationInt
@@ -52,6 +53,15 @@ object Mutex {
   }
 }
 
+final case class State[F[_]](
+    locked: Boolean,
+    waiting: Queue[F, Signal[F]]
+)
+
+object State {
+  type Signal[F[_]] = Deferred[F, Unit]
+}
+
 /** The above solution works, this one (under `createSimpleMutex`) uses the hints from the video,
   * and then `createMutexWithCancellation` is part 2 (cancelling).
   *
@@ -63,23 +73,12 @@ object Mutex {
   * Queue means that this is probably a purer solution.
   */
 object MutexV2 {
-  private type Signal[F[_]] = Deferred[F, Unit]
-  private final case class State[F[_]](
-      locked: Boolean,
-      waiting: Queue[F, Signal[F]]
-  )
-
   def create[F[_]](implicit A: Async[F]): F[Mutex[F]] =
     for {
       queue <- Queue.unbounded[F, Signal[F]]
       unlocked = State(locked = false, queue)
       ref <- Ref[F].of(unlocked)
-    } yield createMutexWithCancellation[F](ref)
-
-  private def createSimpleMutex[F[_]](
-      ref: Ref[F, State[F]]
-  )(implicit A: Async[F]): Mutex[F] =
-    new Mutex[F] {
+    } yield new Mutex[F] {
       /*
        * Change the state of the Ref:
        * - If unlocked, state becomes (true, [])
@@ -126,13 +125,17 @@ object MutexV2 {
           _ <- signal.get
         } yield ()
     }
+}
 
-  /** Exercise 2: What if we cancel the fiber? What things should be cancellable?
-    */
-  private def createMutexWithCancellation[F[_]](
-      ref: Ref[F, State[F]]
-  )(implicit A: Async[F]): Mutex[F] =
-    new Mutex[F] {
+/** Exercise 2: What if we cancel the fiber? What things should be cancellable?
+  */
+object MutexWithCancellation {
+  def create[F[_]](implicit A: Async[F]): F[Mutex[F]] =
+    for {
+      queue <- Queue.unbounded[F, Signal[F]]
+      unlocked = State(locked = false, queue)
+      ref <- Ref[F].of(unlocked)
+    } yield new Mutex[F] {
       override def acquire: F[Unit] =
         A.uncancelable { poll =>
           ref.modify {
@@ -285,7 +288,7 @@ object MutexPlayground extends IOApp.Simple {
 
   private def demoCancellingTasks[F[_]: Async: Parallel]: F[List[Int]] =
     for {
-      mutex <- MutexV2.create[F]
+      mutex <- MutexWithCancellation.create[F]
       results <-
         (1 to 10).toList.parTraverse[F, Int](
           createCancellingTask[F](_, mutex)
