@@ -240,14 +240,14 @@ object CustomCountDownLatchSolution {
     } yield new CustomCountDownLatch[F] {
       override def await: F[Unit] =
         stateRef.get.flatMap {
-          case Done => A.unit
-          case _    => signal.get
+          case Done() => A.unit
+          case _      => signal.get
         }
 
       override def release: F[Unit] =
         stateRef
           .modify {
-            case Done            => Done[F]() -> A.unit
+            case Done()          => Done[F]() -> A.unit
             case Live(1, signal) => Done[F]() -> signal.complete(()).void
             case Live(n, signal) => Live(n - 1, signal) -> A.unit
           }
