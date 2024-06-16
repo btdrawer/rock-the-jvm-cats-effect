@@ -195,5 +195,37 @@ object PolymorphicCoordination extends IOApp.Simple {
       }
   }
 
-  override def run: IO[Unit] = timer[IO](5)
+  /* Later video - there was a bug in the video code, but as it happens, my Mutex already passes! */
+  private def demoCancelWhileBlocked(): IO[Unit] =
+    for {
+      mutex <- Mutex.create[IO]
+      fib1 <-
+        (IO("[fib1] getting mutex").debug >>
+          mutex.acquire >>
+          IO("[fib1] got mutex, never releasing").debug >>
+          IO.never).start
+      fib2 <-
+        (IO("[fib2] sleeping").debug >>
+          IO.sleep(1.second) >>
+          IO("[fib2] trying to get mutex").debug >>
+          mutex.acquire >>
+          IO("[fib2] acquired mutex").debug).start
+      fib3 <-
+        (IO("[fib3] sleeping").debug >>
+          IO.sleep(1500.millis) >>
+          IO("[fib3] trying to get mutex").debug >>
+          mutex.acquire >>
+          IO(
+            "[fib3] if this shows, then FAIL"
+          ).debug).start // fib3 should never acquire the mutex because it was never released
+      _ <-
+        IO.sleep(2.seconds) >>
+          IO("cancelling fib2").debug >>
+          fib2.cancel
+      _ <- fib1.join
+      _ <- fib2.join
+      _ <- fib3.join
+    } yield ()
+
+  override def run: IO[Unit] = demoCancelWhileBlocked()
 }

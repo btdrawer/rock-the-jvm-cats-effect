@@ -85,7 +85,7 @@ object PolymorphicAsync extends IOApp.Simple {
     }
 
   // video solutions:
-  private def never[F[_]: Async, A]: F[A] =
+  private def neverSolution[F[_]: Async, A]: F[A] =
     Async[F].async_(_ => ()) // callback never invoked
 
   private def async_[F[_]: Async, A](
